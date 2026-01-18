@@ -1,0 +1,979 @@
+//+------------------------------------------------------------------+
+//|                                     MA_Crossover_Analysis.mq5     |
+//|                                  Copyright 2024, Trading AI       |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2024, Trading AI"
+#property link      "https://www.mql5.com"
+#property version   "1.00"
+#property strict
+
+//--- Input Parameters
+input group "Moving Average Settings"
+input int              InpMAPeriod       = 20;          // MA Period
+input ENUM_MA_METHOD   InpMAMethod       = MODE_EMA;    // MA Method
+input ENUM_APPLIED_PRICE InpMAAppliedPrice = PRICE_CLOSE; // Applied Price
+
+input group "CSV Logging Settings"
+input string           InpStatsFilename  = "Crossover_Stats.csv";   // CSV-1: Stats Filename
+input string           InpImpulseFilename = "Impulse_Reversal.csv"; // CSV-2: Impulse Filename
+
+input group "Analysis Settings"
+input int              InpHistoryBars     = 500;         // Bars to scan on start
+input double           InpRevThresholdPct = 30.0;        // Reversal Threshold % (Legacy - kept for compatibility)
+input double           InpMinPeakDist     = 10.0;        // Min Price Units to update peak
+input string           InpRangeSegments   = "5-10,11-15,16-20,21-25,26-30"; // Range Segments for Classification
+input string           InpMultiThresholds = "20,30,40,50"; // Multiple Reversal Thresholds %
+
+//--- Global Variables
+int      handleMA;
+datetime lastBarTime;
+double   basePrice = 0; 
+double   crossoverStartMA = 0;
+double   currentPeak = 0; // Local peak (resets after reversal)
+double   globalTrendExtremum = 0; // Absolute peak for the entire trend (never resets)
+double   globalTrendStartPrice = 0; // Absolute start price of the trend (never resets)
+double   globalTrendPeakMA = 0;   // MA Value at the moment the peak was established
+bool     isTrendActive = false;
+string   trendDir = ""; 
+int      barsInTrend = 0; // Tracks bars since crossover or reset
+
+// Added Metadata Tracking
+datetime globalScanStart;
+datetime globalScanEnd;
+
+// Internal counters for debugging
+int      statsCount = 0;
+int      impulseCount = 0;
+
+//--- Range Segment Variables
+struct RangeSegment
+{
+   double minVal;
+   double maxVal;
+   string label;
+};
+RangeSegment rangeSegments[];
+int totalSegments = 0;
+
+//--- Multiple Threshold Variables
+double multiThresholds[];
+bool   thresholdHitStatus[];
+double thresholdHitPrices[]; // NEW: Store actual prices where thresholds were hit
+double lastThresholdPrice = 0; // NEW: Track the last threshold price hit
+int    totalThresholds = 0;
+string dynamicHeaders = ""; // Will store dynamic column headers
+
+//--- State Variables for Time/Session Tracking
+datetime baseTime;        // Time of BasePrice (Start of wave)
+datetime currentPeakTime; // Time of CurrentPeak
+datetime globalTrendPeakTime; // Time of GlobalTrendExtremum
+
+//--- Stats for CSV-1
+datetime crossoverStartTime;
+
+//--- New CSV-2 Variables
+double   csv2EntryPrice = 0;      // Actual crossover entry price
+datetime csv2EntryTime;           // Time of crossover entry
+double   csv2Peak = 0;            // Peak/Trough for current cycle
+datetime csv2PeakTime;            // Time of peak/trough
+double   csv2ReversalTarget = 0;  // Calculated reversal target price
+bool     csv2CycleActive = false; // Is CSV-2 cycle tracking active
+string   csv2Direction = "";      // Direction of current CSV-2 cycle
+
+//+------------------------------------------------------------------+
+//| Session Helper Functions                                         |
+//+------------------------------------------------------------------+
+bool IsSessionActive(int curMin, int startMin, int endMin)
+{
+   if(startMin < endMin)
+      return (curMin >= startMin && curMin < endMin);
+   else
+      return (curMin >= startMin || curMin < endMin);
+}
+
+string GetSessionFromTime(datetime serverTime)
+{
+   // 1. Convert Server Time to GMT (Approximate assumption: Server is UTC+2 or similar, but we rely on TimeGMT internal)
+   // We will use a calculated offset in OnInit to be safer, or just use TimeGMT() if live.
+   // For History Scan (TimeTradeServer unavailable for specific bars?), we need a fixed offset.
+   // Let's assume standard IST conversion: GMT + 5:30.
+   // We need to know GMT of the 'serverTime'.
+   // If 'serverTime' passed is from iTime, it is Server Time.
+   
+   static long serverOffset = 0; 
+   static bool offsetInit = false;
+   if(!offsetInit)
+   {
+      serverOffset = TimeTradeServer() - TimeGMT();
+      offsetInit = true;
+   }
+   
+   datetime gmtTime = serverTime - (datetime)serverOffset;
+   datetime istTime = gmtTime + (5 * 3600) + (30 * 60); // IST Offset
+
+   MqlDateTime ist;
+   TimeToStruct(istTime, ist);
+   int istMinutes = ist.hour * 60 + ist.min;
+
+   // IST session times
+   int sydneyStart =  2 * 60 + 30, sydneyEnd = 11 * 60 + 30;
+   int tokyoStart  =  5 * 60 + 30, tokyoEnd  = 14 * 60 + 30;
+   int londonStart = 12 * 60 + 30, londonEnd = 21 * 60 + 30;
+   int nyStart     = 17 * 60 + 30, nyEnd     =  2 * 60 + 30;
+
+   string sessions = "";
+   if(IsSessionActive(istMinutes, sydneyStart, sydneyEnd)) sessions += "SYDNEY ";
+   if(IsSessionActive(istMinutes, tokyoStart, tokyoEnd))   sessions += "TOKYO ";
+   if(IsSessionActive(istMinutes, londonStart, londonEnd)) sessions += "LONDON ";
+   if(IsSessionActive(istMinutes, nyStart, nyEnd))         sessions += "NY ";
+   
+   if(sessions == "") return "QUIET";
+   
+   // Trim trailing space
+   StringTrimRight(sessions);
+   return sessions;
+}
+
+//+------------------------------------------------------------------+
+//| Parse Range Segments from Input String                          |
+//+------------------------------------------------------------------+
+void ParseRangeSegments()
+{
+   string segments[];
+   int segCount = StringSplit(InpRangeSegments, ',', segments);
+   
+   ArrayResize(rangeSegments, segCount);
+   totalSegments = 0;
+   
+   for(int i = 0; i < segCount; i++)
+   {
+      StringTrimLeft(segments[i]);
+      StringTrimRight(segments[i]);
+      
+      string parts[];
+      if(StringSplit(segments[i], '-', parts) == 2)
+      {
+         rangeSegments[totalSegments].minVal = StringToDouble(parts[0]);
+         rangeSegments[totalSegments].maxVal = StringToDouble(parts[1]);
+         rangeSegments[totalSegments].label = segments[i];
+         totalSegments++;
+      }
+   }
+   
+   Print(">>> Parsed ", totalSegments, " range segments successfully");
+}
+
+//+------------------------------------------------------------------+
+//| Parse Multiple Thresholds from Input String                     |
+//+------------------------------------------------------------------+
+void ParseMultiThresholds()
+{
+   string thresholds[];
+   int threshCount = StringSplit(InpMultiThresholds, ',', thresholds);
+   
+   ArrayResize(multiThresholds, threshCount);
+   ArrayResize(thresholdHitStatus, threshCount);
+   ArrayResize(thresholdHitPrices, threshCount); // NEW: Resize price tracking array
+   totalThresholds = 0;
+   dynamicHeaders = "";
+   
+   for(int i = 0; i < threshCount; i++)
+   {
+      StringTrimLeft(thresholds[i]);
+      StringTrimRight(thresholds[i]);
+      
+      double threshVal = StringToDouble(thresholds[i]);
+      if(threshVal > 0)
+      {
+         multiThresholds[totalThresholds] = threshVal;
+         thresholdHitStatus[totalThresholds] = false;
+         thresholdHitPrices[totalThresholds] = 0; // NEW: Initialize price tracking
+         
+         // Build dynamic header
+         if(dynamicHeaders != "") dynamicHeaders += ",";
+         dynamicHeaders += "Hit_" + thresholds[i] + "%";
+         
+         totalThresholds++;
+      }
+   }
+   
+   // Sort thresholds in ascending order
+   for(int i = 0; i < totalThresholds - 1; i++)
+   {
+      for(int j = i + 1; j < totalThresholds; j++)
+      {
+         if(multiThresholds[i] > multiThresholds[j])
+         {
+            double temp = multiThresholds[i];
+            multiThresholds[i] = multiThresholds[j];
+            multiThresholds[j] = temp;
+         }
+      }
+   }
+   
+   Print(">>> Parsed ", totalThresholds, " thresholds successfully: ", InpMultiThresholds);
+}
+
+//+------------------------------------------------------------------+
+//| Reset Threshold Hit Status                                      |
+//+------------------------------------------------------------------+
+void ResetThresholdStatus()
+{
+   for(int i = 0; i < totalThresholds; i++)
+   {
+      thresholdHitStatus[i] = false;
+      thresholdHitPrices[i] = 0; // NEW: Reset price tracking
+   }
+   lastThresholdPrice = 0; // NEW: Reset last threshold price
+}
+
+//+------------------------------------------------------------------+
+//| Check and Update Threshold Status (Sequential)                  |
+//+------------------------------------------------------------------+
+void UpdateThresholdStatus(double currentPrice)
+{
+   if(!csv2CycleActive || totalThresholds == 0) return;
+   
+   double impulse = (csv2Direction == "BULLISH") ? (csv2Peak - csv2EntryPrice) : (csv2EntryPrice - csv2Peak);
+   if(impulse < InpMinPeakDist) 
+   {
+      // Print(">>> Threshold Check Skipped: Impulse ", impulse, " < MinPeakDist ", InpMinPeakDist);
+      return; // Must meet minimum impulse
+   }
+   
+   // Check thresholds sequentially (must hit in order)
+   for(int i = 0; i < totalThresholds; i++)
+   {
+      if(thresholdHitStatus[i]) continue; // Already hit
+      
+      // Calculate threshold target price
+      double thresholdAmount = impulse * (multiThresholds[i] / 100.0);
+      double targetPrice;
+      
+      if(csv2Direction == "BULLISH")
+         targetPrice = csv2Peak - thresholdAmount;
+      else
+         targetPrice = csv2Peak + thresholdAmount;
+      
+      // Check if threshold is hit
+      bool thresholdHit = false;
+      if(csv2Direction == "BULLISH" && currentPrice <= targetPrice)
+         thresholdHit = true;
+      else if(csv2Direction == "BEARISH" && currentPrice >= targetPrice)
+         thresholdHit = true;
+      
+      if(thresholdHit)
+      {
+         thresholdHitStatus[i] = true;
+         thresholdHitPrices[i] = currentPrice; // NEW: Store the actual hit price
+         lastThresholdPrice = currentPrice; // NEW: Update last threshold price
+         Print(">>> Threshold Hit: ", multiThresholds[i], "% at price ", currentPrice, " (Target: ", targetPrice, ")");
+      }
+      else
+      {
+         break; // Stop checking - must hit thresholds in sequence
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Generate Dynamic Threshold Status String for CSV                |
+//+------------------------------------------------------------------+
+string GetThresholdStatusString()
+{
+   string statusStr = "";
+   for(int i = 0; i < totalThresholds; i++)
+   {
+      if(statusStr != "") statusStr += ",";
+      statusStr += thresholdHitStatus[i] ? "TRUE" : "FALSE";
+   }
+   return statusStr;
+}
+
+//+------------------------------------------------------------------+
+//| Classify Distance into Range Segment                            |
+//+------------------------------------------------------------------+
+string ClassifyDistanceSegment(double distance)
+{
+   double absDistance = MathAbs(distance);
+   
+   // Check if falls within any defined range
+   for(int i = 0; i < totalSegments; i++)
+   {
+      if(absDistance >= rangeSegments[i].minVal && absDistance <= rangeSegments[i].maxVal)
+         return "Range_" + rangeSegments[i].label;
+   }
+   
+   // If below first range
+   if(totalSegments > 0 && absDistance < rangeSegments[0].minVal)
+      return "Below_" + DoubleToString(rangeSegments[0].minVal, 0);
+   
+   // If above last range
+   if(totalSegments > 0 && absDistance > rangeSegments[totalSegments-1].maxVal)
+      return "Above_" + DoubleToString(rangeSegments[totalSegments-1].maxVal, 0);
+   
+   return "UNCLASSIFIED";
+}
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   globalScanStart = TimeCurrent();
+   globalScanEnd   = TimeCurrent();
+   
+   // Parse range segments from input
+   ParseRangeSegments();
+   
+   // Parse multiple thresholds from input
+   ParseMultiThresholds();
+   
+   handleMA = iMA(_Symbol, _Period, InpMAPeriod, 0, InpMAMethod, InpMAAppliedPrice);
+   
+   if(handleMA == INVALID_HANDLE)
+   {
+      Print("!!! CRITICAL ERROR: Failed to create indicator handles.");
+      return(INIT_FAILED);
+   }
+
+   // --- DIAGNOSTIC WRITE TEST ---
+   // We use FILE_COMMON to make files easy to find and persistent across Strategy Tester runs.
+   string testFilename = "EA_Write_Test.txt";
+   int testFile = FileOpen(testFilename, FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON);
+   if(testFile != INVALID_HANDLE)
+   {
+      FileWrite(testFile, "Write test successful at " + TimeToString(TimeCurrent()));
+      FileClose(testFile);
+      Print(">>> DIAGNOSTIC: Write permission confirmed in FILE_COMMON folder.");
+      FileDelete(testFilename, FILE_COMMON);
+   }
+   else
+   {
+      Print("!!! DIAGNOSTIC ERROR: Cannot write to folder. Error code: ", _LastError);
+   }
+
+   // Initialize CSV-1 Headers locally
+   if(!FileIsExist(InpStatsFilename, 0))
+   {
+      int file = FileOpen(InpStatsFilename, FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
+      if(file != INVALID_HANDLE)
+      {
+         FileWrite(file, "StartTime", "EndTime", "Direction", "StartPrice", "EndPrice", "MaxMinPrice", "Distance", "MAValue", "Segment", "Session_Start", "Session_Peak", "Session_End", "Symbol", "TF", "MAPeriod", "MAType", "ScanStart", "ScanEnd");
+         FileClose(file);
+         Print(">>> CSV-1 Created Success: ", InpStatsFilename);
+      }
+      else Print("!!! CSV-1 ERROR: Could not create file: ", _LastError);
+   }
+
+   // Initialize CSV-2 Headers locally
+   if(!FileIsExist(InpImpulseFilename, 0))
+   {
+      int file = FileOpen(InpImpulseFilename, FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
+      if(file != INVALID_HANDLE)
+      {
+         string baseHeaders = "Time,Direction,EntryPrice,Peak,TriggerPrice,Impulse,Pullback,Segment," + dynamicHeaders + ",Session_Entry,Session_Peak,Session_Trigger,Symbol,TF,MAPeriod,MAType,ScanStart,ScanEnd";
+         FileWrite(file, baseHeaders);
+         FileClose(file);
+         Print(">>> CSV-2 Created Success: ", InpImpulseFilename);
+         Print(">>> Dynamic Headers: ", dynamicHeaders);
+      }
+      else Print("!!! CSV-2 ERROR: Could not create file: ", _LastError);
+   }
+
+   // --- INDICATOR READINESS CHECK ---
+   Print(">>> Waiting for Indicators to calculate buffers...");
+   int timeout = 0;
+   while(BarsCalculated(handleMA) < InpHistoryBars + 5 && timeout < 100)
+   {
+      Sleep(50);
+      timeout++;
+   }
+   
+   if(BarsCalculated(handleMA) < InpHistoryBars)
+      Print("!!! WARNING: MA buffer not fully loaded. Only ", BarsCalculated(handleMA), " bars ready.");
+   else
+      Print(">>> MA Ready: ", BarsCalculated(handleMA), " bars calculated.");
+
+   // --- HISTORY SCAN ---
+   statsCount = 0;
+   impulseCount = 0;
+   Print(">>> STARTING HISTORY SCAN (", InpHistoryBars, " bars)...");
+   RunHistoryScan();
+   
+   Print("==================================================================");
+   Print("SCANNED: ", InpHistoryBars, " bars.");
+   Print("LOGGED: ", statsCount, " Crossovers and ", impulseCount, " Impulse rows.");
+   Print("FILE LOCATION: File -> Open Data Folder -> MQL5 -> Files");
+   Print("==================================================================");
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Scan past bars to populate CSV immediately                       |
+//+------------------------------------------------------------------+
+void RunHistoryScan()
+{
+   // We scan from oldest to newest
+   for(int i = InpHistoryBars; i >= 1; i--)
+   {
+      AnalyzeCrossover(i);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   IndicatorRelease(handleMA);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Only process on new bar closure
+   datetime currentTime = iTime(_Symbol, _Period, 0);
+   if(currentTime == lastBarTime) return;
+   
+   // A new bar has opened.
+   if(lastBarTime != 0)
+   {
+      // Analyze the bar that JUST closed (index 1)
+      AnalyzeCrossover(1);
+   }
+   
+   lastBarTime = currentTime;
+}
+
+//+------------------------------------------------------------------+
+//| Core Analysis Logic (Index 1 for live, i for history)            |
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Core Analysis Logic (New CSV-2 Cycle Logic)                     |
+//+------------------------------------------------------------------+
+void AnalyzeCrossover(int idx)
+{
+   double maVal1 = GetMAValue(idx);     
+   double maVal2 = GetMAValue(idx + 1); 
+   double close1 = iClose(_Symbol, _Period, idx);
+   double close2 = iClose(_Symbol, _Period, idx + 1);
+   double high1  = iHigh(_Symbol, _Period, idx);
+   double low1   = iLow(_Symbol, _Period, idx);
+   
+   if(maVal1 == 0 || maVal2 == 0) return;
+
+   // === CSV-1 LOGIC (Original crossover tracking) ===
+   // 1. Detect Standard Crossover Completion (Trend Termination)
+   if(isTrendActive)
+   {
+      bool crossoverEnded = false;
+      if(trendDir == "BULLISH" && close1 < maVal1) crossoverEnded = true;
+      if(trendDir == "BEARISH" && close1 > maVal1) crossoverEnded = true;
+      
+      if(crossoverEnded)
+      {
+         LogCSV1(close1, iTime(_Symbol, _Period, idx));
+         isTrendActive = false;
+         trendDir = "";
+         barsInTrend = 0;
+      }
+   }
+
+   // === CSV-2 CYCLE LOGIC ===
+   if(csv2CycleActive)
+   {
+      // Check for significant new high/low (Scenario 1: New High Reached)
+      bool significantNewPeak = false;
+      if(csv2Direction == "BULLISH" && high1 > csv2Peak + InpMinPeakDist)
+      {
+         significantNewPeak = true;
+      }
+      else if(csv2Direction == "BEARISH" && low1 < csv2Peak - InpMinPeakDist)
+      {
+         significantNewPeak = true;
+      }
+      
+      if(significantNewPeak)
+      {
+         // Save current cycle data before updating to new peak
+         double impulse = (csv2Direction == "BULLISH") ? (csv2Peak - csv2EntryPrice) : (csv2EntryPrice - csv2Peak);
+         
+         if(impulse >= InpMinPeakDist) // Check minimum impulse requirement
+         {
+            double pullback = (csv2Direction == "BULLISH") ? (csv2Peak - low1) : (high1 - csv2Peak);
+            
+            LogNewCSV2(csv2Peak, impulse, pullback, idx, "NEW_HIGH");
+            Print(">>> CSV-2 LOGGED: NEW_HIGH | Impulse: ", impulse, " | Thresholds: ", GetThresholdStatusString());
+         }
+         else
+         {
+            Print(">>> CSV-2 Skipped NEW_HIGH: Impulse ", impulse, " < MinPeakDist ", InpMinPeakDist);
+         }
+         
+         // END cycle - wait for next crossover
+         csv2CycleActive = false;
+         return;
+      }
+      
+      // Update peak and check if we should save and exit
+      if(csv2Direction == "BULLISH" && high1 > csv2Peak)
+      {
+         double oldPeak = csv2Peak; // Save the old peak before updating
+         datetime oldPeakTime = csv2PeakTime; // Save old peak time
+         
+         csv2Peak = high1;
+         csv2PeakTime = iTime(_Symbol, _Period, idx);
+         Print(">>> Peak Updated: ", csv2Peak, " (BULLISH)");
+         
+         // Check if ANY threshold has been hit
+         bool anyThresholdHit = false;
+         for(int i = 0; i < totalThresholds; i++)
+         {
+            if(thresholdHitStatus[i]) 
+            {
+               anyThresholdHit = true;
+               break;
+            }
+         }
+         
+         // If ANY threshold hit, SAVE and END cycle using OLD peak
+         if(anyThresholdHit)
+         {
+            double impulse = oldPeak - csv2EntryPrice; // Use old peak for impulse
+            if(impulse >= InpMinPeakDist)
+            {
+               double pullback = oldPeak - lastThresholdPrice; // Use last threshold price for pullback
+               
+               // Temporarily set csv2Peak back to old value for logging
+               double tempNewPeak = csv2Peak;
+               datetime tempNewPeakTime = csv2PeakTime;
+               csv2Peak = oldPeak;
+               csv2PeakTime = oldPeakTime;
+               
+               LogNewCSV2(lastThresholdPrice, impulse, pullback, idx, "NEW_HIGH_AFTER_THRESHOLD"); // Use last threshold price as trigger
+               Print(">>> CSV-2 LOGGED: NEW_HIGH after threshold hit | Old Peak: ", oldPeak, " | Trigger Price: ", lastThresholdPrice, " | Impulse: ", impulse, " | Thresholds: ", GetThresholdStatusString());
+               
+               // Restore new peak values (though cycle will end)
+               csv2Peak = tempNewPeak;
+               csv2PeakTime = tempNewPeakTime;
+            }
+            
+            // END cycle - wait for next crossover
+            csv2CycleActive = false;
+            return;
+         }
+         else
+         {
+            Print(">>> Continue tracking - no thresholds hit yet");
+         }
+      }
+      else if(csv2Direction == "BEARISH" && low1 < csv2Peak)
+      {
+         double oldPeak = csv2Peak; // Save the old peak before updating
+         datetime oldPeakTime = csv2PeakTime; // Save old peak time
+         
+         csv2Peak = low1;
+         csv2PeakTime = iTime(_Symbol, _Period, idx);
+         Print(">>> Peak Updated: ", csv2Peak, " (BEARISH)");
+         
+         // Check if ANY threshold has been hit
+         bool anyThresholdHit = false;
+         for(int i = 0; i < totalThresholds; i++)
+         {
+            if(thresholdHitStatus[i]) 
+            {
+               anyThresholdHit = true;
+               break;
+            }
+         }
+         
+         // If ANY threshold hit, SAVE and END cycle using OLD peak
+         if(anyThresholdHit)
+         {
+            double impulse = csv2EntryPrice - oldPeak; // Use old peak for impulse
+            if(impulse >= InpMinPeakDist)
+            {
+               double pullback = lastThresholdPrice - oldPeak; // Use last threshold price for pullback
+               
+               // Temporarily set csv2Peak back to old value for logging
+               double tempNewPeak = csv2Peak;
+               datetime tempNewPeakTime = csv2PeakTime;
+               csv2Peak = oldPeak;
+               csv2PeakTime = oldPeakTime;
+               
+               LogNewCSV2(lastThresholdPrice, impulse, pullback, idx, "NEW_LOW_AFTER_THRESHOLD"); // Use last threshold price as trigger
+               Print(">>> CSV-2 LOGGED: NEW_LOW after threshold hit | Old Peak: ", oldPeak, " | Trigger Price: ", lastThresholdPrice, " | Impulse: ", impulse, " | Thresholds: ", GetThresholdStatusString());
+               
+               // Restore new peak values (though cycle will end)
+               csv2Peak = tempNewPeak;
+               csv2PeakTime = tempNewPeakTime;
+            }
+            
+            // END cycle - wait for next crossover
+            csv2CycleActive = false;
+            return;
+         }
+         else
+         {
+            Print(">>> Continue tracking - no thresholds hit yet");
+         }
+      }
+      
+      // Update threshold status based on current price movement
+      UpdateThresholdStatus(csv2Direction == "BULLISH" ? low1 : high1);
+      
+      // Check for MA re-cross (Scenario 2: MA Cross Exit)
+      bool maCrossExit = false;
+      if(csv2Direction == "BULLISH" && close1 < maVal1) maCrossExit = true;
+      if(csv2Direction == "BEARISH" && close1 > maVal1) maCrossExit = true;
+      
+      if(maCrossExit)
+      {
+         // Log CSV-2 with MA cross trigger (only if minimum impulse met)
+         double impulse = (csv2Direction == "BULLISH") ? (csv2Peak - csv2EntryPrice) : (csv2EntryPrice - csv2Peak);
+         
+         if(impulse >= InpMinPeakDist) // Check minimum impulse requirement
+         {
+            double pullback = (csv2Direction == "BULLISH") ? (csv2Peak - close1) : (close1 - csv2Peak);
+            
+            LogNewCSV2(close1, impulse, pullback, idx, "MA_CROSS");
+            Print(">>> CSV-2 LOGGED: MA_CROSS | Impulse: ", impulse, " | Thresholds: ", GetThresholdStatusString());
+         }
+         else
+         {
+            Print(">>> CSV-2 Skipped MA_CROSS: Impulse ", impulse, " < MinPeakDist ", InpMinPeakDist);
+         }
+         
+         // END cycle - wait for next crossover
+         csv2CycleActive = false;
+      }
+   }
+
+   // 2. Detect New Crossover Start (CSV-1)
+   bool newBullish = (close2 <= maVal2 && close1 > maVal1);
+   bool newBearish = (close2 >= maVal2 && close1 < maVal1);
+
+   if(newBullish || newBearish)
+   {
+      // CSV-1 Setup
+      isTrendActive = true;
+      basePrice = maVal1;
+      baseTime = iTime(_Symbol, _Period, idx);
+      globalTrendStartPrice = close1;
+      barsInTrend = 0;
+      crossoverStartTime = iTime(_Symbol, _Period, idx);
+      crossoverStartMA = maVal1;
+      trendDir = newBullish ? "BULLISH" : "BEARISH";
+      
+      if(newBullish) 
+      {
+          currentPeak = high1;
+          currentPeakTime = iTime(_Symbol, _Period, idx);
+          globalTrendExtremum = high1;
+          globalTrendPeakMA = maVal1;
+          globalTrendPeakTime = iTime(_Symbol, _Period, idx);
+      }
+      else
+      {
+          currentPeak = low1;
+          currentPeakTime = iTime(_Symbol, _Period, idx);
+          globalTrendExtremum = low1;
+          globalTrendPeakMA = maVal1;
+          globalTrendPeakTime = iTime(_Symbol, _Period, idx);
+      }
+      
+      // === NEW CSV-2 CYCLE START ===
+      csv2CycleActive = true;
+      csv2EntryPrice = close1;  // Actual crossover price
+      csv2EntryTime = iTime(_Symbol, _Period, idx);
+      csv2Direction = trendDir;
+      csv2Peak = newBullish ? high1 : low1;
+      csv2PeakTime = iTime(_Symbol, _Period, idx);
+      ResetThresholdStatus(); // Reset all threshold flags
+      
+      Print(">>> CSV-2 CYCLE STARTED: ", trendDir, " | Entry: ", csv2EntryPrice, " | Peak: ", csv2Peak);
+      
+      return; 
+   }
+
+   // === ORIGINAL CSV-1 ONGOING ANALYSIS ===
+   if(isTrendActive)
+   {
+      barsInTrend++;
+      
+       if(trendDir == "BULLISH")
+       {
+          if(high1 > globalTrendExtremum)
+          {
+             globalTrendExtremum = high1;
+             globalTrendPeakMA = maVal1;
+             globalTrendPeakTime = iTime(_Symbol, _Period, idx);
+          }
+
+          if(high1 > currentPeak + InpMinPeakDist)
+          {
+             currentPeak = high1;
+             currentPeakTime = iTime(_Symbol, _Period, idx);
+          }
+         else
+         {
+            double impulse = currentPeak - basePrice;
+            double pullback = currentPeak - low1;
+            double revPct = (impulse > 0) ? (pullback / impulse) * 100.0 : 0;
+            
+            if(impulse >= InpMinPeakDist && revPct > InpRevThresholdPct)
+            {
+               // This is the old CSV-2 logic - keeping for compatibility if needed
+               // LogCSV2(currentPeak, low1, impulse, pullback, revPct, idx);
+               basePrice = maVal1;
+               baseTime = iTime(_Symbol, _Period, idx);
+               currentPeak = high1;
+               currentPeakTime = iTime(_Symbol, _Period, idx);
+               barsInTrend = 0;
+            }
+         }
+      }
+       else if(trendDir == "BEARISH")
+       {
+          if(low1 < globalTrendExtremum)
+          {
+              globalTrendExtremum = low1;
+              globalTrendPeakMA = maVal1;
+              globalTrendPeakTime = iTime(_Symbol, _Period, idx);
+          }
+
+          if(low1 < currentPeak - InpMinPeakDist)
+          {
+             currentPeak = low1;
+             currentPeakTime = iTime(_Symbol, _Period, idx);
+          }
+         else
+         {
+            double impulse = basePrice - currentPeak;
+            double pullback = high1 - currentPeak;
+            double revPct = (impulse > 0) ? (pullback / impulse) * 100.0 : 0;
+            
+            if(impulse >= InpMinPeakDist && revPct > InpRevThresholdPct)
+            {
+               // This is the old CSV-2 logic - keeping for compatibility if needed
+               // LogCSV2(currentPeak, high1, impulse, pullback, revPct, idx);
+               basePrice = maVal1;
+               baseTime = iTime(_Symbol, _Period, idx);
+               currentPeak = low1;
+               currentPeakTime = iTime(_Symbol, _Period, idx);
+               barsInTrend = 0;
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Logging Functions                                                |
+//+------------------------------------------------------------------+
+void LogCSV1(double endPrice, datetime endTime)
+{
+   double distance = 0;
+   // Use GLOBAL Extremum and START MA/Price for correct full-trend distance
+   if(trendDir == "BULLISH") distance = globalTrendExtremum - crossoverStartMA;
+   else                      distance = crossoverStartMA - globalTrendExtremum;
+
+   ResetLastError();
+   int file = FileOpen(InpStatsFilename, FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
+   if(file == INVALID_HANDLE)
+   {
+      file = FileOpen(InpStatsFilename, FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
+      if(file != INVALID_HANDLE) 
+         FileWrite(file, "StartTime", "EndTime", "Direction", "StartPrice", "EndPrice", "MaxMinPrice", "Distance", "MAValue", "Segment", "Session_Start", "Session_Peak", "Session_End", "Symbol", "TF", "MAPeriod", "MAType", "ScanStart", "ScanEnd");
+   }
+
+   if(file != INVALID_HANDLE)
+   {
+      string segmentLabel = ClassifyDistanceSegment(distance);
+      
+      FileSeek(file, 0, SEEK_END);
+      FileWrite(file, 
+                TimeToString(crossoverStartTime), 
+                TimeToString(endTime),
+                trendDir, 
+                DoubleToString(globalTrendStartPrice, _Digits), 
+                DoubleToString(endPrice, _Digits), 
+                DoubleToString(globalTrendExtremum, _Digits), 
+                DoubleToString(distance, _Digits), 
+                DoubleToString(globalTrendPeakMA, _Digits),
+                segmentLabel, // New Segment column
+                GetSessionFromTime(crossoverStartTime), // Session_Start
+                GetSessionFromTime(globalTrendPeakTime), // Session_Peak
+                GetSessionFromTime(endTime), // Session_End
+                _Symbol,
+                EnumToString(_Period),
+                IntegerToString(InpMAPeriod),
+                EnumToString(InpMAMethod),
+                TimeToString(globalScanStart),
+                TimeToString(TimeCurrent()));
+      FileClose(file);
+      statsCount++;
+      Print(">>> SAVED CROSSOVER: ", trendDir, " | Segment: ", segmentLabel);
+   }
+   else Print("!!! CSV-1 ERROR: Failed to open. Error: ", _LastError);
+}
+
+//+------------------------------------------------------------------+
+//| New CSV-2 Logging Function with Dynamic Thresholds             |
+//+------------------------------------------------------------------+
+void LogNewCSV2(double triggerPrice, double impulse, double pullback, int idx, string triggerType)
+{
+   ResetLastError();
+   
+   // Try to open file for append first
+   int file = FileOpen(InpImpulseFilename, FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
+   if(file == INVALID_HANDLE)
+   {
+      // If file doesn't exist, create it with headers
+      file = FileOpen(InpImpulseFilename, FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
+      if(file != INVALID_HANDLE)
+      {
+         // Write headers using FileWrite for CSV format
+         string baseHeaders = "Time,Direction,EntryPrice,Peak,TriggerPrice,Impulse,Pullback,Segment," + dynamicHeaders + ",Session_Entry,Session_Peak,Session_Trigger,Symbol,TF,MAPeriod,MAType,ScanStart,ScanEnd";
+         FileWriteString(file, baseHeaders + "\n");
+         FileClose(file);
+         
+         // Reopen for append
+         file = FileOpen(InpImpulseFilename, FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
+      }
+   }
+
+   if(file != INVALID_HANDLE)
+   {
+      string segmentLabel = ClassifyDistanceSegment(impulse);
+      string thresholdStatus = GetThresholdStatusString();
+      
+      // Move to end of file for append
+      FileSeek(file, 0, SEEK_END);
+      
+      // Build the complete row data as a single string
+      string rowData = TimeToString(iTime(_Symbol, _Period, idx)) + "," +
+                      csv2Direction + "," +
+                      DoubleToString(csv2EntryPrice, _Digits) + "," +
+                      DoubleToString(csv2Peak, _Digits) + "," +
+                      DoubleToString(triggerPrice, _Digits) + "," +
+                      DoubleToString(impulse, _Digits) + "," +
+                      DoubleToString(pullback, _Digits) + "," +
+                      segmentLabel + "," +
+                      thresholdStatus + "," +
+                      GetSessionFromTime(csv2EntryTime) + "," +
+                      GetSessionFromTime(csv2PeakTime) + "," +
+                      GetSessionFromTime(iTime(_Symbol, _Period, idx)) + "," +
+                      _Symbol + "," +
+                      EnumToString(_Period) + "," +
+                      IntegerToString(InpMAPeriod) + "," +
+                      EnumToString(InpMAMethod) + "," +
+                      TimeToString(globalScanStart) + "," +
+                      TimeToString(TimeCurrent());
+      
+      // Write as raw string to handle dynamic columns
+      FileWriteString(file, rowData + "\n");
+      FileClose(file);
+      impulseCount++;
+      Print(">>> SAVED CSV-2: ", csv2Direction, " | Trigger: ", triggerType, " | Segment: ", segmentLabel, " | Thresholds: ", thresholdStatus);
+   }
+   else 
+   {
+      Print("!!! CSV-2 ERROR: Failed to open file. Error: ", _LastError);
+      Print("!!! Filename: ", InpImpulseFilename);
+      Print("!!! Attempting alternative write method...");
+      
+      // Alternative: Try FILE_COMMON flag
+      ResetLastError();
+      file = FileOpen(InpImpulseFilename, FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON);
+      if(file != INVALID_HANDLE)
+      {
+         string segmentLabel = ClassifyDistanceSegment(impulse);
+         string thresholdStatus = GetThresholdStatusString();
+         
+         string rowData = TimeToString(iTime(_Symbol, _Period, idx)) + "," +
+                         csv2Direction + "," +
+                         DoubleToString(csv2EntryPrice, _Digits) + "," +
+                         DoubleToString(csv2Peak, _Digits) + "," +
+                         DoubleToString(triggerPrice, _Digits) + "," +
+                         DoubleToString(impulse, _Digits) + "," +
+                         DoubleToString(pullback, _Digits) + "," +
+                         segmentLabel + "," +
+                         thresholdStatus + "," +
+                         GetSessionFromTime(csv2EntryTime) + "," +
+                         GetSessionFromTime(csv2PeakTime) + "," +
+                         GetSessionFromTime(iTime(_Symbol, _Period, idx)) + "," +
+                         _Symbol + "," +
+                         EnumToString(_Period) + "," +
+                         IntegerToString(InpMAPeriod) + "," +
+                         EnumToString(InpMAMethod) + "," +
+                         TimeToString(globalScanStart) + "," +
+                         TimeToString(TimeCurrent());
+         
+         FileWriteString(file, rowData + "\n");
+         FileClose(file);
+         impulseCount++;
+         Print(">>> SAVED CSV-2 (Alternative): ", csv2Direction, " | Trigger: ", triggerType);
+      }
+      else
+      {
+         Print("!!! CSV-2 CRITICAL ERROR: Cannot write to any location. Error: ", _LastError);
+      }
+   }
+}
+
+void LogCSV2(double peak, double trigPrice, double impulse, double pullback, double revPct, int idx)
+{
+   ResetLastError();
+   int file = FileOpen(InpImpulseFilename, FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
+   if(file == INVALID_HANDLE)
+   {
+      file = FileOpen(InpImpulseFilename, FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
+      if(file != INVALID_HANDLE)
+         FileWrite(file, "Time", "Direction", "BasePrice", "Peak", "TriggerPrice", "Impulse", "Pullback", "Reversal%", "Session_Start", "Session_Peak", "Session_End", "Symbol", "TF", "MAPeriod", "MAType", "ScanStart", "ScanEnd");
+   }
+
+   if(file != INVALID_HANDLE)
+   {
+      FileSeek(file, 0, SEEK_END);
+      FileWrite(file, 
+                TimeToString(iTime(_Symbol, _Period, idx)), 
+                trendDir, 
+                DoubleToString(basePrice, _Digits), 
+                DoubleToString(peak, _Digits), 
+                DoubleToString(trigPrice, _Digits), 
+                DoubleToString(impulse, _Digits), 
+                DoubleToString(pullback, _Digits), 
+                DoubleToString(revPct, 2),
+                GetSessionFromTime(baseTime), // Session_Start (of impulse)
+                GetSessionFromTime(currentPeakTime), // Session_Peak
+                GetSessionFromTime(iTime(_Symbol, _Period, idx)), // Session_End (Trigger)
+                _Symbol,
+                EnumToString(_Period),
+                IntegerToString(InpMAPeriod),
+                EnumToString(InpMAMethod),
+                TimeToString(globalScanStart),
+                TimeToString(TimeCurrent()));
+      FileClose(file);
+      impulseCount++;
+   }
+   else Print("!!! CSV-2 ERROR: Failed to open. Error: ", _LastError);
+}
+
+//+------------------------------------------------------------------+
+//| Helpers: Get Indicator Values                                    |
+//+------------------------------------------------------------------+
+double GetMAValue(int index)
+{
+   double buffer[1];
+   if(CopyBuffer(handleMA, 0, index, 1, buffer) > 0)
+      return buffer[0];
+   return 0;
+}
+
+
