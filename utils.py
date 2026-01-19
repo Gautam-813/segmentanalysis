@@ -100,7 +100,7 @@ class ChartGenerator:
                 text=[[f'{val:.2f}' for val in row] for row in heatmap_data],
                 texttemplate="%{text}",
                 textfont=dict(size=14, family="Arial", color="white"),
-                colorbar=dict(title="Avg Distance", titlefont=dict(size=14))
+                colorbar=dict(title=dict(text="Avg Distance", font=dict(size=14)))
             ))
             
             fig.update_layout(
@@ -148,7 +148,7 @@ class ChartGenerator:
                 text=[[f'{val:.1f}%' for val in row] for row in heatmap_data],
                 texttemplate="%{text}",
                 textfont=dict(size=14, family="Arial", color="white"),
-                colorbar=dict(title="Success Rate %", titlefont=dict(size=14))
+                colorbar=dict(title=dict(text="Success Rate %", font=dict(size=14)))
             ))
             
             fig.update_layout(
@@ -361,7 +361,7 @@ class ChartGenerator:
                 colorscale='Viridis',
                 showscale=True,
                 textfont=dict(size=14, family="Arial", color="white"),
-                colorbar=dict(title="Count/Value", titlefont=dict(size=14))
+                colorbar=dict(title=dict(text="Count/Value", font=dict(size=14)))
             ))
             
             # Update annotation sizes
@@ -440,7 +440,7 @@ class ChartGenerator:
                 colorscale='RdYlGn',
                 showscale=True,
                 textfont=dict(size=14, family="Arial", color="white"),
-                colorbar=dict(title="Count/Value", titlefont=dict(size=14))
+                colorbar=dict(title=dict(text="Count/Value", font=dict(size=14)))
             ))
             
             # Update annotation sizes
